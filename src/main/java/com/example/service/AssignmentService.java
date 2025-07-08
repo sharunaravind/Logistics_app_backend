@@ -1,4 +1,9 @@
 package com.example.service;
+import com.example.entity.Order;
+import com.google.ortools.constraintsolver.*;
+import com.google.protobuf.Duration;
+import org.apache.commons.math3.ml.clustering.Cluster;
+import org.apache.commons.math3.ml.clustering.Clusterable;
 
 import com.example.entity.Address;
 import com.example.entity.Order;
@@ -11,6 +16,7 @@ import com.example.model.VehicleStatus;
 import com.example.repository.OrderRepository;
 import com.example.repository.VehicleRepository;
 
+import org.apache.commons.math3.ml.clustering.DBSCANClusterer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,12 +27,10 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.data.jpa.domain.Specification;
 import javax.persistence.criteria.Predicate;
 
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.time.ZoneOffset;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import com.example.model.PaginatedVehicleAssignmentResponse;
@@ -43,6 +47,28 @@ import org.springframework.data.domain.Pageable;
 @Service
 public class AssignmentService {
 
+    public class OrderClusterPoint implements Clusterable {
+        private final Order order;
+        private final double[] point;
+
+        public OrderClusterPoint(Order order) {
+            this.order = order;
+            this.point = new double[] {
+                    order.getCustomer().getDeliveryAddress().getLatitude(),
+                    order.getCustomer().getDeliveryAddress().getLongitude()
+            };
+        }
+
+        public Order getOrder() {
+            return order;
+        }
+
+        @Override
+        public double[] getPoint() {
+            return this.point;
+        }
+    }
+
     private static final Logger log = LoggerFactory.getLogger(AssignmentService.class);
 
     private static final Address DEPOT_LOCATION_CONFIG;
@@ -52,6 +78,8 @@ public class AssignmentService {
     private static final Map<String, VehicleTypeConstraints> VEHICLE_TYPE_CONSTRAINTS = new HashMap<>();
 
     static {
+
+        System.loadLibrary("jniortools");
         DEPOT_LOCATION_CONFIG = new Address();
         // UPDATED DEPOT TO COIMBATORE FOR MORE REALISTIC TESTING WITH COIMBATORE ORDERS
         DEPOT_LOCATION_CONFIG.setStreet("123, Main Depot Road"); // Example Coimbatore Depot Street
@@ -102,163 +130,98 @@ public class AssignmentService {
 
     @Transactional
     public AssignmentSummaryResponse performBatchAssignment(AssignOrdersRequest assignOrdersRequest) {
-        log.info("Starting batch assignment process...");
-        OffsetDateTime assignmentStartTime = OffsetDateTime.now();
-        String readyStatusValue = getInternalReadyStatusValue();
+        log.info("Starting advanced batch assignment process...");
 
-        Specification<Order> assignableOrdersSpec = (root, query, cb) -> {
-            List<Predicate> predicates = new ArrayList<>();
-            predicates.add(cb.equal(root.get("internalProcessingStatus"), readyStatusValue));
-            predicates.add(cb.isNull(root.get("assignedVehicle")));
-            predicates.add(cb.isNotNull(root.get("deliveryDeadline")));
-            predicates.add(cb.greaterThan(root.get("deliveryDeadline"), assignmentStartTime));
-            return cb.and(predicates.toArray(new Predicate[0]));
-        };
-        List<Order> assignableOrders = orderRepository.findAll(assignableOrdersSpec);
-        assignableOrders.sort(Comparator.comparing(Order::getDeliveryDeadline, Comparator.nullsLast(Comparator.naturalOrder()))
-                .thenComparing(Order::getOrderDate, Comparator.nullsLast(Comparator.naturalOrder())));
+        // STEP 1: FILTER & FETCH
+        OffsetDateTime todayStart = LocalDate.now().atStartOfDay().atOffset(ZoneOffset.UTC);
+        OffsetDateTime todayEnd = todayStart.plusDays(1);
+
+        List<Order> assignableOrders = orderRepository.findAll((root, query, cb) ->
+                cb.and(
+                        cb.equal(root.get("internalProcessingStatus"), "ReadyForDispatch"),
+                        cb.isNull(root.get("assignedVehicle")),
+                        cb.between(root.get("deliveryDeadline"), todayStart, todayEnd)
+                )
+        );
 
         if (assignableOrders.isEmpty()) {
-            log.info("No assignable orders found (check status, assignment, and future deadline).");
-            return createSummary(0, 0, "No assignable orders available that meet criteria.");
+            return createSummary(0, 0, "No orders due today are ready for dispatch.");
         }
-        log.info("Found {} orders eligible for assignment.", assignableOrders.size());
 
-        List<Vehicle> availableVehicleEntities = vehicleRepository.findByVehicleStatus(VehicleStatus.AVAILABLE);
-        if (availableVehicleEntities.isEmpty()) {
-            log.info("No vehicles currently available for assignment.");
-            return createSummary(0, 0, "No vehicles are currently available.");
+        List<Vehicle> availableVehicles = vehicleRepository.findByVehicleStatus(VehicleStatus.AVAILABLE);
+        if (availableVehicles.isEmpty()) {
+            return createSummary(0, 0, "No vehicles are available.");
         }
-        log.info("Found {} vehicles available for assignment.", availableVehicleEntities.size());
-
-        List<VehicleRouteState> vehicleStates = availableVehicleEntities.stream()
-                .map(vehicle -> new VehicleRouteState(vehicle, DEPOT_LOCATION_CONFIG, assignmentStartTime, directionsService))
+        List<VehicleRouteState> vehicleStates = availableVehicles.stream()
+                .map(VehicleRouteState::new)
                 .collect(Collectors.toList());
 
-        int assignmentsCreatedCount = 0;
+        // STEP 2: CLUSTER
+        ClusterResult clusterResult = performClustering(assignableOrders);
+        List<Cluster<OrderClusterPoint>> rawClusters = clusterResult.clusters;
+        List<Order> outliers = clusterResult.outliers;
 
-        for (Order order : assignableOrders) {
-            log.debug("Evaluating order ID: {} (Deadline: {})", order.getId(), order.getDeliveryDeadline());
-            if (order.getCustomer() == null || order.getCustomer().getDeliveryAddress() == null ||
-                    order.getCustomer().getDeliveryAddress().getLocation() == null) {
-                log.warn("Order {} is missing customer delivery address or valid coordinates. Skipping.", order.getId());
-                continue;
-            }
-            if (order.getSourceLocation() == null || order.getSourceLocation().getLocation() == null) {
-                log.warn("Order {} is missing source location or valid coordinates. Skipping.", order.getId());
-            }
+        // STEP 3: PRIORITIZE
+        List<PriorityCluster> priorityClusters = new ArrayList<>();
+        for (Cluster<OrderClusterPoint> cluster : rawClusters) {
+            priorityClusters.add(new PriorityCluster(cluster));
+        }
+        priorityClusters.sort(Comparator.comparing(PriorityCluster::getUrgency));
 
+        // STEP 4: ASSIGN CLUSTERS TO VEHICLES
+        for (PriorityCluster pCluster : priorityClusters) {
+            List<Order> ordersInCluster = pCluster.getOrders();
+            VehicleRouteState bestVehicle = findBestVehicleForCluster(ordersInCluster, vehicleStates);
 
-            VehicleRouteState bestVehicleForThisOrder = null;
-            DirectionsApiHelperService.RouteDetails bestLegDetailsForThisOrder = null;
-            OffsetDateTime bestArrivalTimeAtOrder = null;
-            double minCostMetricForThisOrder = Double.MAX_VALUE;
-            boolean wouldBeLateForBestOption = false;
+            if (bestVehicle != null) {
+                // A. Find Optimal Route using OR-Tools
+                RouteSolution routeSolution = findOptimalRouteForCluster(ordersInCluster, DEPOT_LOCATION_CONFIG);
 
-            for (VehicleRouteState currentVehicleState : vehicleStates) {
-                log.trace("Evaluating vehicle {} for order {}", currentVehicleState.vehicleEntity.getRegistrationNumber(), order.getId());
-                if (currentVehicleState.isEffectivelyFullOrDone()) {
-                    log.trace("Vehicle {} is effectively full or done.", currentVehicleState.vehicleEntity.getRegistrationNumber());
-                    continue;
+                if (routeSolution.isSolvable()) {
+                    // B. Final Validation: Check total tour duration
+                    long serviceTime = (long) ordersInCluster.size() * FIXED_SERVICE_TIME_SECONDS;
+                    long totalDuration = routeSolution.getDurationSeconds() + serviceTime;
+
+                    if (bestVehicle.canAccommodateDuration(totalDuration)) {
+                        // C. Assignment is valid and confirmed!
+                        bestVehicle.assignRoute(routeSolution.getRoute(), totalDuration);
+                        log.info("ASSIGNED Cluster of {} orders to vehicle {}", ordersInCluster.size(), bestVehicle.vehicleEntity.getRegistrationNumber());
+                    } else {
+                        log.warn("Vehicle {} could handle capacity but NOT DURATION for cluster. Route time: {}s", bestVehicle.vehicleEntity.getRegistrationNumber(), totalDuration);
+                    }
                 }
-                if (!currentVehicleState.canAccommodate(order)) {
-                    log.trace("Vehicle {} cannot accommodate order {}.", currentVehicleState.vehicleEntity.getRegistrationNumber(), order.getId());
-                    continue;
-                }
-
-                Address originForLeg = currentVehicleState.getLastStopLocation();
-                Address destinationForLeg = order.getCustomer().getDeliveryAddress();
-                log.trace("Calculating leg for vehicle {} from city {} to city {}", currentVehicleState.vehicleEntity.getRegistrationNumber(), originForLeg.getCity(), destinationForLeg.getCity());
-                DirectionsApiHelperService.RouteDetails legToOrderDetails = directionsService.getRouteDetails(originForLeg, destinationForLeg, null, false);
-
-                if (legToOrderDetails == null) {
-                    log.warn("Could not calculate leg route for order {} with vehicle {}. Origin: {}, Dest: {}. Skipping this vehicle for this order.",
-                            order.getId(), currentVehicleState.vehicleEntity.getRegistrationNumber(), originForLeg.getStreet(), destinationForLeg.getStreet());
-                    continue;
-                }
-                log.trace("Leg to order {} for vehicle {}: Duration {}s, Distance {}m", order.getId(), currentVehicleState.vehicleEntity.getRegistrationNumber(), legToOrderDetails.durationSeconds, legToOrderDetails.distanceMeters);
-
-
-                OffsetDateTime estimatedArrivalTimeAtThisOrder = currentVehicleState.getCurrentTimeAtLastStop().plusSeconds(legToOrderDetails.durationSeconds);
-                OffsetDateTime estimatedDepartureTimeAfterService = estimatedArrivalTimeAtThisOrder.plusSeconds(FIXED_SERVICE_TIME_SECONDS);
-
-                if (!currentVehicleState.canUndertakeAdditionalLeg(legToOrderDetails, order.getCustomer().getDeliveryAddress(), DEPOT_LOCATION_CONFIG)) {
-                    continue;
-                }
-
-                double costFactor = getCostFactorForVehicle(currentVehicleState.vehicleEntity.getVehicleType());
-                double currentRouteCostMetric = legToOrderDetails.distanceMeters * costFactor;
-                boolean isPotentiallyLate = false;
-
-                if (estimatedDepartureTimeAfterService.isAfter(order.getDeliveryDeadline())) {
-                    currentRouteCostMetric += LATE_DELIVERY_PENALTY_COST;
-                    isPotentiallyLate = true;
-                    log.debug("Order {} (Deadline: {}) would be LATE (Est. Departure: {}) with vehicle {}. Penalty applied. New cost: {}",
-                            order.getId(), order.getDeliveryDeadline(), estimatedDepartureTimeAfterService, currentVehicleState.vehicleEntity.getRegistrationNumber(), currentRouteCostMetric);
-                } else {
-                    log.trace("Order {} (Deadline: {}) ON TIME (Est. Departure: {}) with vehicle {}. Cost: {}",
-                            order.getId(), order.getDeliveryDeadline(), estimatedDepartureTimeAfterService, currentVehicleState.vehicleEntity.getRegistrationNumber(), currentRouteCostMetric);
-                }
-
-
-                if (currentRouteCostMetric < minCostMetricForThisOrder) {
-                    minCostMetricForThisOrder = currentRouteCostMetric;
-                    bestVehicleForThisOrder = currentVehicleState;
-                    bestLegDetailsForThisOrder = legToOrderDetails;
-                    bestArrivalTimeAtOrder = estimatedArrivalTimeAtThisOrder;
-                    wouldBeLateForBestOption = isPotentiallyLate;
-                    log.debug("Tentative best assignment for order {}: Vehicle {}, CostMetric {}", order.getId(), currentVehicleState.vehicleEntity.getRegistrationNumber(), currentRouteCostMetric);
-                }
-            }
-
-            if (bestVehicleForThisOrder != null) {
-                int routeSequenceNum = bestVehicleForThisOrder.assignedOrders.size() + 1;
-                order.setRouteSequenceNumber(routeSequenceNum);
-
-                bestVehicleForThisOrder.addOrder(order, bestLegDetailsForThisOrder, bestArrivalTimeAtOrder);
-                assignmentsCreatedCount++;
-                log.info("ASSIGNED order {} (Seq: {}) to vehicle {}. ETA: {}{}. Vehicle load W: {}, V: {}. Vehicle Current Route Dist: {}m, Dur: {}s",
-                        order.getId(), routeSequenceNum, bestVehicleForThisOrder.vehicleEntity.getRegistrationNumber(),
-                        bestArrivalTimeAtOrder, (wouldBeLateForBestOption ? " (LATE)" : ""),
-                        bestVehicleForThisOrder.currentLoadWeight, bestVehicleForThisOrder.currentLoadVolume,
-                        bestVehicleForThisOrder.getCurrentRouteDistanceToLastStopMeters(),
-                        bestVehicleForThisOrder.getCurrentRouteDurationToLastStopSeconds());
-            } else {
-                log.warn("Order {} could not be assigned (no suitable vehicle found after all checks).", order.getId());
             }
         }
 
-        int finalVehiclesUtilizedCount = 0;
+        // STEP 5: (Optional) Handle Outliers - simple assignment for now
+        // Can be enhanced later
+        for (Order outlier : outliers) {
+            // A simple greedy assignment for leftovers
+            // ...
+        }
+
+        // STEP 6: FINALIZE & SAVE
+        int assignmentsCreatedCount = 0;
+        int vehiclesUtilizedCount = 0;
         for (VehicleRouteState vs : vehicleStates) {
             if (vs.isUtilized()) {
-                finalVehiclesUtilizedCount++;
+                vehiclesUtilizedCount++;
                 Vehicle vehicleToUpdate = vs.vehicleEntity;
-                log.info("Finalizing assignments for Vehicle {}: {} orders. Final Est. Total Tour Duration (incl. service & final return): {}s, Final Est. Total Tour Distance: {}m",
-                        vehicleToUpdate.getRegistrationNumber(), vs.assignedOrders.size(),
-                        vs.calculateFinalTotalDurationWithReturn(DEPOT_LOCATION_CONFIG),
-                        vs.calculateFinalTotalDistanceWithReturn(DEPOT_LOCATION_CONFIG));
-
-
-                for (Order orderToUpdate : vs.assignedOrders) {
+                int routeSequence = 1;
+                for (Order orderToUpdate : vs.getAssignedRoute()) {
                     orderToUpdate.setAssignedVehicle(vehicleToUpdate);
                     orderToUpdate.setLogisticsStatus(OrderStatus.OUT_FOR_DELIVERY.getValue());
+                    orderToUpdate.setRouteSequenceNumber(routeSequence++);
                     orderRepository.save(orderToUpdate);
+                    assignmentsCreatedCount++;
                 }
                 vehicleToUpdate.setVehicleStatus(VehicleStatus.IN_TRANSIT);
-                if (vehicleToUpdate.getCapacity() != null) {
-                    vehicleToUpdate.setAvailableCapacity(vehicleToUpdate.getCapacity() - vs.currentLoadWeight);
-                }
-                if (vehicleToUpdate.getVolumeCapacity() != null) {
-                    vehicleToUpdate.setAvailableVolumeCapacity(vehicleToUpdate.getVolumeCapacity() - vs.currentLoadVolume);
-                }
                 vehicleRepository.save(vehicleToUpdate);
             }
         }
 
-        return createSummary(assignmentsCreatedCount, finalVehiclesUtilizedCount,
-                "Batch assignment process completed. Orders assigned: " + assignmentsCreatedCount);
+        return createSummary(assignmentsCreatedCount, vehiclesUtilizedCount, "Batch assignment process completed.");
     }
-
     private String getInternalReadyStatusValue() {
         try {
             return InternalProcessingStatus.READY_FOR_DISPATCH.getValue();
@@ -305,146 +268,35 @@ public class AssignmentService {
     }
 
     private static class VehicleRouteState {
-        Vehicle vehicleEntity;
-        List<Order> assignedOrders = new ArrayList<>();
-        float currentLoadWeight = 0f;
-        float currentLoadVolume = 0f;
-        Address lastStopLocation;
-        OffsetDateTime currentTimeAtLastStop;
-        long currentRouteDurationToLastStopSeconds = 0L;
-        long currentRouteDistanceToLastStopMeters = 0L;
-        boolean utilized = false;
-        DirectionsApiHelperService directionsService;
-        boolean effectivelyFullOrDone = false;
+        final Vehicle vehicleEntity;
+        private boolean utilized = false;
+        private List<Order> assignedRoute = new ArrayList<>();
+        private long totalDurationSeconds = 0;
 
-        public VehicleRouteState(Vehicle vehicleEntity, Address depotLocation, OffsetDateTime batchStartTime, DirectionsApiHelperService directionsService) {
+        public VehicleRouteState(Vehicle vehicleEntity) {
             this.vehicleEntity = vehicleEntity;
-            this.lastStopLocation = depotLocation;
-            this.currentTimeAtLastStop = batchStartTime;
-            this.directionsService = directionsService;
         }
 
-        public boolean isUtilized() { return utilized; }
-        public boolean isEffectivelyFullOrDone() { return effectivelyFullOrDone; }
-        public Address getLastStopLocation() { return lastStopLocation; }
-        public OffsetDateTime getCurrentTimeAtLastStop() { return currentTimeAtLastStop; }
-        public long getCurrentRouteDurationToLastStopSeconds() { return currentRouteDurationToLastStopSeconds; }
-        public long getCurrentRouteDistanceToLastStopMeters() { return currentRouteDistanceToLastStopMeters; }
-
-        public boolean canAccommodate(Order order) {
-            if (order.getParcelDetails() == null) {
-                log.warn("Order {} has no parcel details, cannot check capacity.", order.getId());
-                return false;
-            }
-            Float orderWeight = order.getParcelDetails().getWeight() != null ? order.getParcelDetails().getWeight() : 0f;
-            Float orderVolume = order.getParcelDetails().getVolumeM3() != null ? order.getParcelDetails().getVolumeM3() : 0f;
-
-            float potentialNewLoadWeight = this.currentLoadWeight + orderWeight;
-            float potentialNewLoadVolume = this.currentLoadVolume + orderVolume;
-
-            Float totalWeightCapacity = this.vehicleEntity.getCapacity();
-            Float totalVolumeCapacity = this.vehicleEntity.getVolumeCapacity();
-
-            boolean weightOk = potentialNewLoadWeight <= (totalWeightCapacity != null ? totalWeightCapacity : Float.MAX_VALUE);
-            boolean volumeOk = potentialNewLoadVolume <= (totalVolumeCapacity != null ? totalVolumeCapacity : Float.MAX_VALUE);
-
-            if (!weightOk) log.debug("Vehicle {} fails weight capacity for order {}. Current batch load: {}, Order: {}, Vehicle Total Cap: {}", vehicleEntity.getRegistrationNumber(), order.getId(), this.currentLoadWeight, orderWeight, totalWeightCapacity);
-            if (!volumeOk) log.debug("Vehicle {} fails volume capacity for order {}. Current batch load: {}, Order: {}, Vehicle Total Cap: {}", vehicleEntity.getRegistrationNumber(), order.getId(), this.currentLoadVolume, orderVolume, totalVolumeCapacity);
-
-            return weightOk && volumeOk;
+        public boolean isUtilized() {
+            return this.utilized;
         }
 
-        public boolean canUndertakeAdditionalLeg(DirectionsApiHelperService.RouteDetails legToOrder, Address orderDestination, Address depotLocation) {
-            if (legToOrder == null) {
-                log.warn("Vehicle {}: legToOrder is null, cannot check trip constraints.", vehicleEntity.getRegistrationNumber());
-                return false;
-            }
-            if (orderDestination == null || orderDestination.getLocation() == null) {
-                log.warn("Vehicle {}: orderDestination or its location is null, cannot calculate return for trip constraints.", vehicleEntity.getRegistrationNumber());
-                return false;
-            }
-            if (depotLocation == null || depotLocation.getLocation() == null) {
-                log.warn("Vehicle {}: depotLocation or its location is null, cannot calculate return for trip constraints.", vehicleEntity.getRegistrationNumber());
-                return false;
-            }
-
-
-            VehicleTypeConstraints constraints = VEHICLE_TYPE_CONSTRAINTS.getOrDefault(
-                    this.vehicleEntity.getVehicleType() != null ? this.vehicleEntity.getVehicleType().toUpperCase() : "DEFAULT",
-                    VEHICLE_TYPE_CONSTRAINTS.get("DEFAULT")
-            );
-
-            DirectionsApiHelperService.RouteDetails legReturnToDepot = this.directionsService.getRouteDetails(orderDestination, depotLocation, null, false);
-            if (legReturnToDepot == null) {
-                log.warn("Vehicle {}: Could not calculate return trip from potential order at {} to depot. Assuming it might violate trip constraints.", vehicleEntity.getRegistrationNumber(), orderDestination.getCity());
-                this.effectivelyFullOrDone = true;
-                return false;
-            }
-
-            long potentialTotalDuration = this.currentRouteDurationToLastStopSeconds
-                    + legToOrder.durationSeconds
-                    + FIXED_SERVICE_TIME_SECONDS
-                    + legReturnToDepot.durationSeconds;
-
-            boolean durationOk = potentialTotalDuration <= constraints.maxDurationSeconds;
-            if (!durationOk) {
-                log.debug("Vehicle {} adding order {} would exceed max trip duration. Potential: {}s (CurrentRouteDur: {}s + LegToOrder: {}s + Service: {}s + ReturnLeg: {}s), Max: {}s",
-                        vehicleEntity.getRegistrationNumber(), orderDestination.getCity(),
-                        potentialTotalDuration,
-                        this.currentRouteDurationToLastStopSeconds, legToOrder.durationSeconds, FIXED_SERVICE_TIME_SECONDS, legReturnToDepot.durationSeconds,
-                        constraints.maxDurationSeconds);
-                this.effectivelyFullOrDone = true;
-            }
-            return durationOk;
+        public List<Order> getAssignedRoute() {
+            return this.assignedRoute;
         }
 
-        public void addOrder(Order order, DirectionsApiHelperService.RouteDetails legToOrder, OffsetDateTime arrivalAtOrder) {
-            this.assignedOrders.add(order);
-            if (order.getParcelDetails() != null) {
-                if (order.getParcelDetails().getWeight() != null) this.currentLoadWeight += order.getParcelDetails().getWeight();
-                if (order.getParcelDetails().getVolumeM3() != null) this.currentLoadVolume += order.getParcelDetails().getVolumeM3();
-            }
-
-            this.currentRouteDistanceToLastStopMeters += legToOrder.distanceMeters;
-            this.currentRouteDurationToLastStopSeconds += legToOrder.durationSeconds + FIXED_SERVICE_TIME_SECONDS;
-
-            this.lastStopLocation = order.getCustomer().getDeliveryAddress();
-            this.currentTimeAtLastStop = arrivalAtOrder.plusSeconds(FIXED_SERVICE_TIME_SECONDS);
+        public void assignRoute(List<Order> route, long duration) {
+            this.assignedRoute = route;
+            this.totalDurationSeconds = duration;
             this.utilized = true;
+        }
 
-            VehicleTypeConstraints currentConstraints = VEHICLE_TYPE_CONSTRAINTS.getOrDefault(
-                    this.vehicleEntity.getVehicleType() != null ? this.vehicleEntity.getVehicleType().toUpperCase() : "DEFAULT",
-                    VEHICLE_TYPE_CONSTRAINTS.get("DEFAULT")
+        public boolean canAccommodateDuration(long tourDurationSeconds) {
+            VehicleTypeConstraints constraints = VEHICLE_TYPE_CONSTRAINTS.getOrDefault(
+                this.vehicleEntity.getVehicleType() != null ? this.vehicleEntity.getVehicleType().toUpperCase() : "DEFAULT",
+                VEHICLE_TYPE_CONSTRAINTS.get("DEFAULT")
             );
-            if (this.lastStopLocation != null && this.lastStopLocation.getLocation() != null && DEPOT_LOCATION_CONFIG.getLocation() != null) {
-                DirectionsApiHelperService.RouteDetails finalReturnLeg = this.directionsService.getRouteDetails(this.lastStopLocation, DEPOT_LOCATION_CONFIG, null, false);
-                if (finalReturnLeg != null) {
-                    if ((this.currentRouteDurationToLastStopSeconds + finalReturnLeg.durationSeconds) > currentConstraints.maxDurationSeconds) {
-                        this.effectivelyFullOrDone = true;
-                        log.debug("Vehicle {} marked as effectively full/done after adding order {} due to trip duration limit with final return.", vehicleEntity.getRegistrationNumber(), order.getId());
-                    }
-                } else {
-                    this.effectivelyFullOrDone = true;
-                    log.warn("Vehicle {} marked as effectively full/done as return to depot from {} could not be calculated after adding order {}.", vehicleEntity.getRegistrationNumber(), this.lastStopLocation.getCity(), order.getId());
-                }
-            } else {
-                this.effectivelyFullOrDone = true;
-                log.warn("Vehicle {} marked as effectively full/done due to missing location data for final check after adding order {}.", vehicleEntity.getRegistrationNumber(), order.getId());
-            }
-        }
-
-        public long calculateFinalTotalDurationWithReturn(Address depotLocation) {
-            if (assignedOrders.isEmpty()) return 0;
-            if (lastStopLocation == null || lastStopLocation.getLocation() == null || depotLocation == null || depotLocation.getLocation() == null) return currentRouteDurationToLastStopSeconds;
-            DirectionsApiHelperService.RouteDetails returnLeg = directionsService.getRouteDetails(lastStopLocation, depotLocation, null, false);
-            return currentRouteDurationToLastStopSeconds + (returnLeg != null ? returnLeg.durationSeconds : 0);
-        }
-
-        public long calculateFinalTotalDistanceWithReturn(Address depotLocation) {
-            if (assignedOrders.isEmpty()) return 0;
-            if (lastStopLocation == null || lastStopLocation.getLocation() == null || depotLocation == null || depotLocation.getLocation() == null) return currentRouteDistanceToLastStopMeters;
-            DirectionsApiHelperService.RouteDetails returnLeg = directionsService.getRouteDetails(lastStopLocation, depotLocation, null, false);
-            return currentRouteDistanceToLastStopMeters + (returnLeg != null ? returnLeg.distanceMeters : 0);
+            return tourDurationSeconds <= constraints.maxDurationSeconds;
         }
     }
 
@@ -517,5 +369,210 @@ public class AssignmentService {
         response.setData(vehicleAssignmentsPage.getContent());
 
         return response;
+    }
+
+    private ClusterResult performClustering(List<Order> orders) {
+        // A. Prepare Orders for Clustering
+        List<OrderClusterPoint> clusterPoints = new ArrayList<>();
+        List<Order> unclusterableOrders = new ArrayList<>(); // For orders with no coordinates
+
+        for (Order order : orders) {
+            if (order.getCustomer() != null &&
+                    order.getCustomer().getDeliveryAddress() != null &&
+                    order.getCustomer().getDeliveryAddress().getLatitude() != null) {
+                clusterPoints.add(new OrderClusterPoint(order));
+            } else {
+                log.warn("Order {} cannot be clustered (missing coordinates).", order.getId());
+                unclusterableOrders.add(order);
+            }
+        }
+
+        // B. Execute Clustering (if there's anything to cluster)
+        if (clusterPoints.isEmpty()) {
+            return new ClusterResult(new ArrayList<>(), unclusterableOrders);
+        }
+
+        // ~2km radius, min 3 orders per cluster
+        DBSCANClusterer<OrderClusterPoint> clusterer = new DBSCANClusterer<>(0.018, 3);
+        List<Cluster<OrderClusterPoint>> rawClusters = clusterer.cluster(clusterPoints);
+
+        // C. Convert back to List<Order> and handle outliers
+        // DBSCAN doesn't explicitly return outliers, so we find them by checking which points were not assigned to any cluster.
+        Set<OrderClusterPoint> allClusteredPoints = rawClusters.stream()
+                .flatMap(c -> c.getPoints().stream())
+                .collect(Collectors.toSet());
+
+        List<Order> outliers = clusterPoints.stream()
+                .filter(p -> !allClusteredPoints.contains(p))
+                .map(OrderClusterPoint::getOrder)
+                .collect(Collectors.toList());
+
+        outliers.addAll(unclusterableOrders); // Add orders that couldn't be clustered at all
+
+        log.info("Clustering found {} clusters and {} outlier orders.", rawClusters.size(), outliers.size());
+
+        return new ClusterResult(rawClusters, outliers);
+    }
+
+    // We'll need a simple helper class to return both results
+    private static class ClusterResult {
+        final List<Cluster<OrderClusterPoint>> clusters;
+        final List<Order> outliers;
+
+        public ClusterResult(List<Cluster<OrderClusterPoint>> clusters, List<Order> outliers) {
+            this.clusters = clusters;
+            this.outliers = outliers;
+        }
+    }
+
+    private VehicleRouteState findBestVehicleForCluster(List<Order> ordersInCluster, List<VehicleRouteState> availableVehicles) {
+        if (ordersInCluster.isEmpty()) {
+            return null;
+        }
+
+        // 1. Calculate the cluster's total requirements
+        float totalWeight = 0f;
+        float totalVolume = 0f;
+        for (Order order : ordersInCluster) {
+            if (order.getParcelDetails() != null) {
+                totalWeight += (order.getParcelDetails().getWeight() != null ? order.getParcelDetails().getWeight() : 0f);
+                totalVolume += (order.getParcelDetails().getVolumeM3() != null ? order.getParcelDetails().getVolumeM3() : 0f);
+            }
+        }
+
+        log.debug("Evaluating cluster of {} orders. Total W: {}, V: {}", ordersInCluster.size(), totalWeight, totalVolume);
+
+        // 2. Find the cheapest vehicle that can handle the load
+        VehicleRouteState bestChoice = null;
+        double lowestCost = Double.MAX_VALUE;
+
+        // Sort vehicles by cost to prioritize cheaper ones (e.g., bikes first)
+        availableVehicles.sort(Comparator.comparingDouble(v -> getCostFactorForVehicle(v.vehicleEntity.getVehicleType())));
+
+        for (VehicleRouteState vehicleState : availableVehicles) {
+            // Check if vehicle is already assigned in this batch
+            if (vehicleState.isUtilized()) {
+                continue;
+            }
+
+            // Check capacity
+            boolean weightOk = totalWeight <= (vehicleState.vehicleEntity.getCapacity() != null ? vehicleState.vehicleEntity.getCapacity() : Float.MAX_VALUE);
+            boolean volumeOk = totalVolume <= (vehicleState.vehicleEntity.getVolumeCapacity() != null ? vehicleState.vehicleEntity.getVolumeCapacity() : Float.MAX_VALUE);
+
+            if (weightOk && volumeOk) {
+                // This vehicle is a candidate. For now, we'll pick the first/cheapest one.
+                // A more advanced check could estimate the total tour duration here.
+                bestChoice = vehicleState;
+                log.info("Found suitable vehicle {} for cluster.", bestChoice.vehicleEntity.getRegistrationNumber());
+                break; // Since we sorted by cost, the first one we find is the best.
+            }
+        }
+
+        return bestChoice;
+    }
+
+
+
+    private RouteSolution findOptimalRouteForCluster(List<Order> ordersInCluster, Address depotLocation) {
+        if (ordersInCluster == null || ordersInCluster.isEmpty()) {
+            return new RouteSolution(new ArrayList<>(), 0);
+        }
+
+        List<Address> locations = new ArrayList<>();
+        locations.add(depotLocation); // Depot is index 0
+        ordersInCluster.forEach(order -> locations.add(order.getCustomer().getDeliveryAddress()));
+
+        final long[][] distanceMatrix = createDistanceMatrix(locations);
+
+        RoutingIndexManager manager = new RoutingIndexManager(distanceMatrix.length, 1, 0);
+        RoutingModel routing = new RoutingModel(manager);
+
+        final int transitCallbackIndex = routing.registerTransitCallback((long fromIndex, long toIndex) -> {
+            int fromNode = manager.indexToNode(fromIndex);
+            int toNode = manager.indexToNode(toIndex);
+            return distanceMatrix[fromNode][toNode];
+        });
+
+        routing.setArcCostEvaluatorOfAllVehicles(transitCallbackIndex);
+
+        RoutingSearchParameters searchParameters = main.defaultRoutingSearchParameters()
+            .toBuilder()
+            .setLocalSearchMetaheuristic(LocalSearchMetaheuristic.Value.GUIDED_LOCAL_SEARCH)
+            .setTimeLimit(Duration.newBuilder().setSeconds(5).build())
+            .build();
+
+        Assignment solution = routing.solveWithParameters(searchParameters);
+
+        if (solution != null) {
+            List<Order> sortedRoute = new ArrayList<>();
+            long totalDuration = 0;
+            long index = routing.start(0);
+            while (!routing.isEnd(index)) {
+                long nextIndex = solution.value(routing.nextVar(index));
+                int nodeIndex = manager.indexToNode(index);
+                int nextNodeIndex = manager.indexToNode(nextIndex);
+
+                // Add the travel duration for this leg of the journey
+                totalDuration += distanceMatrix[nodeIndex][nextNodeIndex];
+
+                if (nodeIndex != 0) {
+                    sortedRoute.add(ordersInCluster.get(nodeIndex - 1));
+                }
+                index = nextIndex;
+            }
+            return new RouteSolution(sortedRoute, totalDuration);
+        } else {
+            log.warn("OR-Tools could not find a solution. Returning empty route.");
+            return new RouteSolution(new ArrayList<>(), 0);
+        }
+    }
+
+    // You'll need this helper method to build the matrix.
+    private long[][] createDistanceMatrix(List<Address> locations) {
+        int size = locations.size();
+        long[][] matrix = new long[size][size];
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                if (i == j) {
+                    matrix[i][j] = 0;
+                } else {
+                    DirectionsApiHelperService.RouteDetails details = directionsService.getRouteDetails(
+                        locations.get(i), locations.get(j), null, false);
+                    // Use duration in seconds as the cost.
+                    matrix[i][j] = (details != null) ? details.durationSeconds : Long.MAX_VALUE;
+                }
+            }
+        }
+        return matrix;
+    }
+
+    // To hold a cluster's orders and its urgency score
+    private static class PriorityCluster {
+        private final List<Order> orders;
+        private final OffsetDateTime urgency; // Earliest deadline in the cluster
+
+        public PriorityCluster(Cluster<OrderClusterPoint> cluster) {
+            this.orders = cluster.getPoints().stream().map(OrderClusterPoint::getOrder).collect(Collectors.toList());
+            this.urgency = this.orders.stream()
+                    .map(Order::getDeliveryDeadline)
+                    .min(OffsetDateTime::compareTo)
+                    .orElse(OffsetDateTime.MAX);
+        }
+        public List<Order> getOrders() { return orders; }
+        public OffsetDateTime getUrgency() { return urgency; }
+    }
+
+    // To hold the result from the OR-Tools solver
+    private static class RouteSolution {
+        private final List<Order> route;
+        private final long durationSeconds;
+
+        public RouteSolution(List<Order> route, long durationSeconds) {
+            this.route = route;
+            this.durationSeconds = durationSeconds;
+        }
+        public boolean isSolvable() { return route != null && !route.isEmpty(); }
+        public List<Order> getRoute() { return route; }
+        public long getDurationSeconds() { return durationSeconds; }
     }
 }
