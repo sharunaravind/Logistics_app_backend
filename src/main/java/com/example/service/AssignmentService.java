@@ -193,11 +193,101 @@ public class AssignmentService {
             }
         }
 
-        // STEP 5: (Optional) Handle Outliers - simple assignment for now
-        // Can be enhanced later
-        for (Order outlier : outliers) {
-            // A simple greedy assignment for leftovers
-            // ...
+        // STEP 5: HANDLE OUTLIERS
+        // We use a pragmatic greedy approach:
+        // 1. Sort outliers by the most urgent delivery deadline.
+        // 2. For each outlier, find the cheapest (cost factor) available
+        // vehicle that can handle it.
+        log.info("Attempting to assign {} outlier orders.", outliers.size());
+        if (!outliers.isEmpty()) {
+          // Prioritize the most urgent outliers first
+          outliers.sort(Comparator.comparing(Order::getDeliveryDeadline));
+
+          // Get a mutable list of vehicles that are still available after
+          // cluster assignment
+          List<VehicleRouteState> availableVehicleStates =
+              vehicleStates.stream()
+                  .filter(vs -> !vs.isUtilized())
+                  .collect(Collectors.toList());
+
+          // Sort available vehicles by cost to ensure we use the cheapest first
+          // (e.g., BIKE > VAN > TRUCK)
+          availableVehicleStates.sort(Comparator.comparingDouble(
+              v -> getCostFactorForVehicle(v.vehicleEntity.getVehicleType())));
+
+          for (Order outlier : outliers) {
+            boolean assigned = false;
+            // Use an iterator to safely remove a vehicle from the list once
+            // it's assigned
+            Iterator<VehicleRouteState> vehicleIterator =
+                availableVehicleStates.iterator();
+
+            while (vehicleIterator.hasNext()) {
+              VehicleRouteState vehicleState = vehicleIterator.next();
+              Vehicle vehicle = vehicleState.vehicleEntity;
+
+              // A. Check capacity
+              float orderWeight =
+                  outlier.getParcelDetails() != null &&
+                          outlier.getParcelDetails().getWeight() != null
+                      ? outlier.getParcelDetails().getWeight()
+                      : 0f;
+              float orderVolume =
+                  outlier.getParcelDetails() != null &&
+                          outlier.getParcelDetails().getVolumeM3() != null
+                      ? outlier.getParcelDetails().getVolumeM3()
+                      : 0f;
+
+              boolean weightOk = orderWeight <= (vehicle.getCapacity() != null
+                                                     ? vehicle.getCapacity()
+                                                     : Float.MAX_VALUE);
+              boolean volumeOk =
+                  orderVolume <= (vehicle.getVolumeCapacity() != null
+                                      ? vehicle.getVolumeCapacity()
+                                      : Float.MAX_VALUE);
+
+              if (weightOk && volumeOk) {
+                // B. Check if vehicle can handle the simple round-trip duration
+                // We calculate a simple Depot -> Outlier -> Depot route
+                DirectionsApiHelperService.RouteDetails toOutlier =
+                    directionsService.getRouteDetails(
+                        DEPOT_LOCATION_CONFIG,
+                        outlier.getCustomer().getDeliveryAddress(), null,
+                        false);
+                DirectionsApiHelperService.RouteDetails fromOutlier =
+                    directionsService.getRouteDetails(
+                        outlier.getCustomer().getDeliveryAddress(),
+                        DEPOT_LOCATION_CONFIG, null, false);
+
+                if (toOutlier != null && fromOutlier != null) {
+                  long travelDuration =
+                      toOutlier.durationSeconds + fromOutlier.durationSeconds;
+                  long totalDuration =
+                      travelDuration + FIXED_SERVICE_TIME_SECONDS;
+
+                  if (vehicleState.canAccommodateDuration(totalDuration)) {
+                    // C. Assign and commit
+                    log.info("ASSIGNED Outlier Order {} to Vehicle {}",
+                             outlier.getId(), vehicle.getRegistrationNumber());
+                    vehicleState.assignRoute(Collections.singletonList(outlier),
+                                             totalDuration);
+
+                    // This vehicle is now used, remove it from consideration
+                    // for other outliers
+                    vehicleIterator.remove();
+                    assigned = true;
+                    break; // Move to the next outlier
+                  }
+                }
+              }
+            } // End of vehicle loop
+
+            if (!assigned) {
+              log.warn("Could not find a suitable vehicle for outlier order " +
+                       "{}. It will remain unassigned.",
+                       outlier.getId());
+            }
+          } // End of outlier loop
         }
 
         // STEP 6: FINALIZE & SAVE
@@ -473,6 +563,61 @@ public class AssignmentService {
 
 
 
+//    private RouteSolution findOptimalRouteForCluster(List<Order> ordersInCluster, Address depotLocation) {
+//        if (ordersInCluster == null || ordersInCluster.isEmpty()) {
+//            return new RouteSolution(new ArrayList<>(), 0);
+//        }
+//
+//        List<Address> locations = new ArrayList<>();
+//        locations.add(depotLocation); // Depot is index 0
+//        ordersInCluster.forEach(order -> locations.add(order.getCustomer().getDeliveryAddress()));
+//
+//        final long[][] distanceMatrix = createDistanceMatrix(locations);
+//
+//        RoutingIndexManager manager = new RoutingIndexManager(distanceMatrix.length, 1, 0);
+//        RoutingModel routing = new RoutingModel(manager);
+//
+//        final int transitCallbackIndex = routing.registerTransitCallback((long fromIndex, long toIndex) -> {
+//            int fromNode = manager.indexToNode(fromIndex);
+//            int toNode = manager.indexToNode(toIndex);
+//            return distanceMatrix[fromNode][toNode];
+//        });
+//
+//        routing.setArcCostEvaluatorOfAllVehicles(transitCallbackIndex);
+//
+//        RoutingSearchParameters searchParameters = main.defaultRoutingSearchParameters()
+//            .toBuilder()
+//            .setLocalSearchMetaheuristic(LocalSearchMetaheuristic.Value.GUIDED_LOCAL_SEARCH)
+//            .setTimeLimit(Duration.newBuilder().setSeconds(5).build())
+//            .build();
+//
+//        Assignment solution = routing.solveWithParameters(searchParameters);
+//
+//        if (solution != null) {
+//            List<Order> sortedRoute = new ArrayList<>();
+//            long totalDuration = 0;
+//            long index = routing.start(0);
+//            while (!routing.isEnd(index)) {
+//                long nextIndex = solution.value(routing.nextVar(index));
+//                int nodeIndex = manager.indexToNode(index);
+//                int nextNodeIndex = manager.indexToNode(nextIndex);
+//
+//                // Add the travel duration for this leg of the journey
+//                totalDuration += distanceMatrix[nodeIndex][nextNodeIndex];
+//
+//                if (nodeIndex != 0) {
+//                    sortedRoute.add(ordersInCluster.get(nodeIndex - 1));
+//                }
+//                index = nextIndex;
+//            }
+//            return new RouteSolution(sortedRoute, totalDuration);
+//        } else {
+//            log.warn("OR-Tools could not find a solution. Returning empty route.");
+//            return new RouteSolution(new ArrayList<>(), 0);
+//        }
+//    }
+
+
     private RouteSolution findOptimalRouteForCluster(List<Order> ordersInCluster, Address depotLocation) {
         if (ordersInCluster == null || ordersInCluster.isEmpty()) {
             return new RouteSolution(new ArrayList<>(), 0);
@@ -495,11 +640,14 @@ public class AssignmentService {
 
         routing.setArcCostEvaluatorOfAllVehicles(transitCallbackIndex);
 
-        RoutingSearchParameters searchParameters = main.defaultRoutingSearchParameters()
-            .toBuilder()
-            .setLocalSearchMetaheuristic(LocalSearchMetaheuristic.Value.GUIDED_LOCAL_SEARCH)
-            .setTimeLimit(Duration.newBuilder().setSeconds(5).build())
-            .build();
+        // **** THIS IS THE CORRECTED PART ****
+        // Use the explicit class name 'com.google.ortools.constraintsolver.main'
+        // to create the search parameters.
+        RoutingSearchParameters searchParameters = com.google.ortools.constraintsolver.main.defaultRoutingSearchParameters()
+                .toBuilder()
+                .setLocalSearchMetaheuristic(LocalSearchMetaheuristic.Value.GUIDED_LOCAL_SEARCH)
+                .setTimeLimit(Duration.newBuilder().setSeconds(5).build())
+                .build();
 
         Assignment solution = routing.solveWithParameters(searchParameters);
 
@@ -515,7 +663,7 @@ public class AssignmentService {
                 // Add the travel duration for this leg of the journey
                 totalDuration += distanceMatrix[nodeIndex][nextNodeIndex];
 
-                if (nodeIndex != 0) {
+                if (nodeIndex != 0) { // Exclude the depot from the final order list
                     sortedRoute.add(ordersInCluster.get(nodeIndex - 1));
                 }
                 index = nextIndex;
